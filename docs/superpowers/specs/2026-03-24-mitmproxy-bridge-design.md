@@ -41,7 +41,14 @@ Three host-side components:
 
 ### Target Hosts
 
-The addon filters by hostname in `request()`/`response()` hooks (not via `--allow-hosts`, which has known bugs with domain matching).
+The bridge uses **narrow interception** in two stages:
+
+1. **Pre-TLS host gate** - before terminating TLS, the proxy checks the CONNECT target / SNI host against the explicit target registry in `hosts.py`. Only matching hosts are intercepted.
+2. **Addon hook filter** - after interception, `request()` / `response()` re-check hostname and path before parsing. This is defense in depth, not the primary interception boundary.
+
+Non-target hosts are tunneled through mitmproxy as opaque CONNECT traffic. They are **not** TLS-terminated, their certificates are not substituted, and request/response bodies are never visible to the addon.
+
+Do not rely on `--allow-hosts` for the interception boundary. Instead, compile the target registry into exact / anchored host matchers at startup and make the intercept vs pass-through decision before TLS decryption.
 
 | CLI | API Key Host | OAuth Host |
 |---|---|---|
@@ -51,16 +58,18 @@ The addon filters by hostname in `request()`/`response()` hooks (not via `--allo
 
 Additional Vertex AI hosts: `aiplatform.googleapis.com`, `{region}-aiplatform.googleapis.com`.
 
-Non-targeted traffic passes through the proxy untouched.
+This keeps interception narrowly scoped to the LLM API surfaces needed for scoring while avoiding accidental breakage on unrelated HTTPS traffic from the CLI process.
 
 ### Request/Response Flow
 
 1. CLI sends HTTPS request through proxy
-2. Addon's `request()` hook captures the request body (JSON-parsed)
-3. mitmproxy forwards to real API with TLS termination on both sides
-4. Addon's `response()` hook captures the complete response. Note: mitmproxy buffers SSE streams, so for streaming API calls (`"stream": true`), the `response()` hook fires only after the full stream completes. This delays state updates but is acceptable for scoring purposes.
-5. Addon detects provider from hostname and URL path, then parses the request/response pair into Inspect's `ChatMessage` list (input) and `ModelOutput` (output) - see "New Parsers" below
-6. Parsed input messages + model output pushed over Unix socket to Inspect
+2. Proxy checks CONNECT target / SNI host against the target registry
+3. Non-target hosts are tunneled without interception. Target hosts proceed to TLS termination
+4. Addon's `request()` hook captures request metadata and body
+5. Addon's `response()` hook captures the complete response body. Note: mitmproxy buffers SSE streams, so for streaming API calls (`"stream": true`), the `response()` hook fires only after the full stream completes. This delays state updates but is acceptable for scoring purposes.
+6. The hook enqueues a raw capture record onto a bounded in-process queue and returns immediately. It does **not** block on provider parsing or Unix socket writes
+7. A background worker detects provider from hostname and URL path, parses the request/response pair into Inspect's `ChatMessage` list (input) and `ModelOutput` (output), and serializes the result for IPC
+8. A background sender pushes parsed generations over the Unix socket to Inspect
 
 ### Provider Detection and Parsing
 
@@ -101,14 +110,39 @@ Each parser must:
 
 This is the largest piece of new implementation work. The existing `inspect_ai.model` conversion utilities (e.g., `ChatMessageAssistant`, `ToolCall`, `ModelUsage`) provide the target types. Reference implementations: `inspect_ai.model._openai_convert`, `inspect_ai.agent._bridge.anthropic_api_impl`, `inspect_ai.agent._bridge.google_api_impl`.
 
+### Delivery Path and Backpressure
+
+The addon must not add user-visible latency to the live API call. To preserve that:
+
+- `response()` only snapshots the raw capture payload (`host`, `path`, headers, request body, response body, status code, timestamps) and enqueues it
+- Parsing, SSE reassembly, Inspect-type conversion, and Unix socket writes all happen off the response path in background tasks
+- The queue is bounded (e.g. `maxsize=64`) so memory use is predictable under bursty agent behavior
+- If the queue fills, drop the **oldest unprocessed** capture, increment a `dropped_generations` counter, and log a warning. Missing state updates are preferable to stalling the CLI's live network call
+- If the Unix socket disconnects, disable further state updates for the sample and keep proxying traffic. Already in-flight API calls must still complete normally
+
 ### State Tracking
 
-The addon pushes `(input_messages, model_output)` pairs over the Unix socket. On the Inspect side, the listener processes each pair:
+The addon pushes parsed generations over the Unix socket. On the Inspect side, each one is treated as a **candidate** main-thread update, not automatically as truth.
 
-1. Call `apply_message_ids(bridge, input_messages)` to assign stable IDs via MM3 hashing (matching the existing bridge's ID scheme)
-2. Call `_track_state(input_messages, model_output)` which replaces `state.messages` with `input + [output.message]` when the message count exceeds the previous generation's count (this avoids overwriting state with shorter side-chain calls)
+Listener algorithm:
 
-`MitmproxyAgentBridge` inherits from `AgentBridge` to reuse `_track_state` and `apply_message_ids`. It passes `filter=None, retry_refusals=None, compaction=None` to the parent constructor since these features are not applicable.
+1. Build `candidate_messages = input_messages + [output.message]`
+2. Call `apply_message_ids(bridge, candidate_messages)` to assign stable IDs via MM3 hashing
+3. Compare the candidate to the **last accepted** generation, not the last observed generation
+4. Accept the candidate if any of these hold:
+   - there is no accepted generation yet
+   - the accepted input IDs are a prefix of the candidate input IDs, meaning the conversation advanced normally
+   - the candidate input IDs contain the accepted tail IDs in order, meaning provider-side compaction / truncation shortened the history but stayed on the same thread
+5. If accepted, replace `state.messages` with `candidate_messages`, set `state.output = model_output`, and advance the accepted baseline
+6. If rejected as a side call, leave the current state untouched and do **not** lower the accepted baseline
+
+`MitmproxyAgentBridge` may inherit from `AgentBridge` to reuse message ID allocation, but it should implement its own candidate-acceptance tracker rather than reusing `AgentBridge._track_state()` verbatim.
+
+Implementation note:
+
+- Keep `accepted_tail_ids` for the last 2-3 accepted non-system messages
+- Use those tail IDs to recognize the same conversation after server-side history trimming
+- Do not let rejected shorter side calls update the message-count baseline
 
 ## MCP Tool Bridging
 
@@ -190,7 +224,12 @@ Per-generation message (addon sends after each intercepted API call):
 }
 ```
 
-The `input_messages` and `model_output` fields are JSON-serialized Inspect `ChatMessage` and `ModelOutput` types respectively, matching the `_track_state(input, output)` API.
+The `input_messages` and `model_output` fields are JSON-serialized Inspect `ChatMessage` and `ModelOutput` types respectively, matching the listener's candidate-update API.
+
+Optional warning message (for observability, not correctness):
+```json
+{"type": "warning", "code": "dropped_generations", "count": 3}
+```
 
 ### Lifecycle
 
@@ -283,7 +322,9 @@ mitmproxy = ["mitmproxy>=10.0"]
 
 Runtime check at bridge creation - fail fast with clear error if not installed. Zero impact on `bridge="default"` users.
 
-The addon script (`addon.py`) imports from `inspect_swe._bridge.ipc` and `inspect_ai.agent._bridge`. This works because mitmdump runs in the same Python environment as Inspect. **Important**: mitmproxy must be installed into the project's venv (via `pip install inspect_swe[mitmproxy]`), not globally. If a user has a system-level mitmproxy and runs `mitmdump -s addon.py`, the imports will fail. The bridge should resolve the `mitmdump` binary from `sys.prefix` to ensure the correct venv is used.
+The addon script (`addon.py`) imports from `inspect_swe._bridge.ipc` plus the concrete Inspect modules it reuses, currently `inspect_ai.agent._bridge.types` (`AgentBridge`) and `inspect_ai.agent._bridge.util` (`apply_message_ids`). Do not import these symbols from the `inspect_ai.agent._bridge` package root.
+
+This works because mitmdump runs in the same Python environment as Inspect. **Important**: mitmproxy must be installed into the project's venv (for example `uv sync --extra mitmproxy`), not globally. If a user has a system-level mitmproxy and runs `mitmdump -s addon.py`, the imports will fail. The bridge should resolve the `mitmdump` binary from `sys.prefix` to ensure the correct venv is used.
 
 ## Error Handling
 
@@ -299,7 +340,7 @@ If the CLI rejects the CA cert, the TLS handshake fails. No `request()` hook fir
 
 ### Unknown API Hosts
 
-Traffic to hosts not in the target registry passes through unmodified. State tracking misses those calls, but nothing breaks. `hosts.py` is the single place to add new targets.
+Traffic to hosts not in the target registry is tunneled without TLS interception. State tracking misses those calls, but nothing breaks. `hosts.py` is the single place to add new targets.
 
 ### Concurrent Samples
 
@@ -308,3 +349,22 @@ Each sample gets its own mitmdump instance on a unique port with its own Unix so
 ### cloudcode-pa Envelope
 
 Gemini OAuth wraps requests in `{model, project, request}`. The addon detects this host and unwraps before parsing. If the envelope format changes, parsing fails gracefully - logs a warning, skips state update, CLI continues working since the proxy is transparent.
+
+## Validation Matrix
+
+Before merging, validate the bridge against this matrix:
+
+- Gemini CLI with API key auth: streaming and non-streaming text responses
+- Gemini CLI with OAuth (`cloudcode-pa.googleapis.com`): streaming and non-streaming responses, including envelope unwrap
+- Claude Code: normal assistant turns plus tool use / tool result turns
+- Codex CLI `/v1/responses`: streaming responses with reasoning blocks and tool calls
+- Codex CLI `/v1/chat/completions`: non-streaming compatibility path if exercised by config
+
+Cross-cutting assertions:
+
+- A non-target HTTPS host is tunneled without certificate substitution or body visibility
+- MCP traffic to `host.docker.internal:{tool_port}` bypasses interception via `NO_PROXY`
+- A short side-channel model call does not replace the accepted main conversation
+- A shorter generation caused by provider-side compaction still updates the accepted main conversation
+- Queue overflow logs a warning and may drop state updates, but the CLI's live API call still succeeds
+- Broken Unix-socket delivery stops state updates but does not break proxying
