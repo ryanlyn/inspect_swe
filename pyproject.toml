@@ -47,6 +47,10 @@ dev = [
     "mini-swe-agent"
 ]
 doc = ["quarto-cli==1.7.31"]
+mitmproxy = [
+    "mitmproxy>=10.0",
+    "mcp>=1.23.0",
+]
 
 [tool.hatch.build]
 only-packages = true
