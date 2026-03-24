@@ -6,13 +6,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from inspect_ai.agent import AgentState, SandboxAgentBridge, agent, sandbox_agent_bridge
+from inspect_ai.agent import AgentState, agent, sandbox_agent_bridge
 from inspect_ai.model import Model, get_model
 from inspect_ai.tool import Skill, install_skills, read_skills
 from inspect_ai.util import ExecRemoteProcess, ExecRemoteStreamingOptions, store
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
+from inspect_swe._bridge.ca import proxy_env, write_ca_cert_to_sandbox
+from inspect_swe._bridge.mitmproxy_bridge import mitmproxy_agent_bridge
+from inspect_swe._bridge.runtime import RuntimeBridge
 from inspect_swe._gemini_cli.agentbinary import ensure_gemini_cli_setup
 from inspect_swe._util.path import join_path
 from inspect_swe.acp import ACPAgent
@@ -50,7 +53,7 @@ class GeminiCli(ACPAgent):
     @asynccontextmanager
     async def _start_agent(
         self, state: AgentState
-    ) -> AsyncIterator[tuple[ExecRemoteProcess, SandboxAgentBridge]]:
+    ) -> AsyncIterator[tuple[ExecRemoteProcess, RuntimeBridge]]:
         sbox = sandbox_env(self.sandbox)
         model = get_model(self.model)
 
@@ -59,15 +62,24 @@ class GeminiCli(ACPAgent):
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
-        async with sandbox_agent_bridge(
-            state,
-            model=None,
-            model_aliases=self.model_map,
-            filter=self.filter,
-            retry_refusals=self.retry_refusals,
-            bridged_tools=self.bridged_tools or None,
-            port=port,
-        ) as bridge:
+        bridge_cm = (
+            sandbox_agent_bridge(
+                state,
+                model=None,
+                model_aliases=self.model_map,
+                filter=self.filter,
+                retry_refusals=self.retry_refusals,
+                bridged_tools=self.bridged_tools or None,
+                port=port,
+            )
+            if self.bridge == "default"
+            else mitmproxy_agent_bridge(
+                state,
+                sandbox=self.sandbox,
+                bridged_tools=self.bridged_tools or None,
+            )
+        )
+        async with bridge_cm as bridge:
             # Install node and gemini CLI in the sandbox.
             gemini_binary, node_binary = await ensure_gemini_cli_setup(
                 sbox, self._version, self.user
@@ -77,6 +89,9 @@ class GeminiCli(ACPAgent):
             # Detect sandbox home directory.
             home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=self.user)
             sandbox_home = home_result.stdout.strip() or "/root"
+            sandbox_ca_path: str | None = None
+            if self.bridge == "mitmproxy":
+                sandbox_ca_path = await write_ca_cert_to_sandbox(sbox)
 
             # Install skills.
             if self._resolved_skills:
@@ -90,11 +105,22 @@ class GeminiCli(ACPAgent):
 
             # Environment variables (matching non-ACP gemini_cli agent).
             agent_env = {
-                "GOOGLE_GEMINI_BASE_URL": f"http://127.0.0.1:{bridge.port}",
-                "GEMINI_API_KEY": "api-key",
                 "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
                 "HOME": sandbox_home,
-            } | self.env
+            }
+            if self.bridge == "default":
+                agent_env |= {
+                    "GOOGLE_GEMINI_BASE_URL": f"http://127.0.0.1:{bridge.port}",
+                    "GEMINI_API_KEY": "api-key",
+                }
+            else:
+                assert sandbox_ca_path is not None
+                agent_env |= {
+                    **proxy_env(bridge.port),
+                    "NODE_EXTRA_CA_CERTS": sandbox_ca_path,
+                    "NODE_USE_SYSTEM_CA": "1",
+                }
+            agent_env |= self.env
 
             # MCP servers are passed via the ACP protocol in the base class
             # (conn.new_session(mcp_servers=...)). Gemini's --experimental-acp

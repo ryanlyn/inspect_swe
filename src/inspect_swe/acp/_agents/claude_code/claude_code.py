@@ -5,13 +5,26 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from inspect_ai.agent import AgentState, SandboxAgentBridge, agent, sandbox_agent_bridge
+from inspect_ai.agent import AgentState, agent, sandbox_agent_bridge
 from inspect_ai.model import Model, get_model
 from inspect_ai.tool import Skill, install_skills, read_skills
 from inspect_ai.util import ExecRemoteProcess, ExecRemoteStreamingOptions
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
+from inspect_swe._bridge.ca import (
+    discover_sandbox_host,
+    proxy_env,
+    write_ca_cert_to_sandbox,
+)
+from inspect_swe._bridge.mitmproxy_bridge import mitmproxy_agent_bridge
+from inspect_swe._bridge.oauth import (
+    copy_optional_host_file_to_sandbox,
+    copy_optional_host_tree_to_sandbox,
+    ensure_sandbox_runtime_user,
+    secure_path_for_user,
+)
+from inspect_swe._bridge.runtime import RuntimeBridge
 from inspect_swe._util.path import join_path
 from inspect_swe.acp import ACPAgent
 from inspect_swe.acp.agent import ACPAgentParams
@@ -64,18 +77,38 @@ class ClaudeCode(ACPAgent):
     @asynccontextmanager
     async def _start_agent(
         self, state: AgentState
-    ) -> AsyncIterator[tuple[ExecRemoteProcess, SandboxAgentBridge]]:
+    ) -> AsyncIterator[tuple[ExecRemoteProcess, RuntimeBridge]]:
         sbox = sandbox_env(self.sandbox)
         default_model = get_model(self.model).canonical_name()
+        runtime_user = self.user
+        sandbox_home: str | None = None
+        runtime_cwd = self.cwd
+        if self.bridge == "mitmproxy":
+            runtime_user, sandbox_home = await ensure_sandbox_runtime_user(
+                sbox,
+                self.user,
+                cwd=self.cwd,
+            )
+            if runtime_cwd in [None, "/root"]:
+                runtime_cwd = sandbox_home
 
-        async with sandbox_agent_bridge(
-            state,
-            model=None,
-            model_aliases=self.model_map,
-            filter=self.filter,
-            retry_refusals=self.retry_refusals,
-            bridged_tools=self.bridged_tools or None,
-        ) as bridge:
+        bridge_cm = (
+            sandbox_agent_bridge(
+                state,
+                model=None,
+                model_aliases=self.model_map,
+                filter=self.filter,
+                retry_refusals=self.retry_refusals,
+                bridged_tools=self.bridged_tools or None,
+            )
+            if self.bridge == "default"
+            else mitmproxy_agent_bridge(
+                state,
+                sandbox=self.sandbox,
+                bridged_tools=self.bridged_tools or None,
+            )
+        )
+        async with bridge_cm as bridge:
             # Install node and claude-agent-acp in the sandbox.
             acp_binary, node_binary = await ensure_claude_code_acp_setup(
                 sbox, self.user
@@ -84,41 +117,100 @@ class ClaudeCode(ACPAgent):
 
             # Use canonical model names — the bridge resolves them via
             # model_aliases to Model instances directly.
+            sandbox_ca_path: str | None = None
+            if self.bridge == "mitmproxy":
+                sandbox_ca_path = await write_ca_cert_to_sandbox(sbox)
+                assert sandbox_home is not None
+                proxy_host = await discover_sandbox_host(
+                    sbox,
+                    user=runtime_user,
+                    cwd=runtime_cwd,
+                )
+                await copy_optional_host_tree_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_HOME_DIR",
+                    sandbox_root=f"{sandbox_home}/.claude",
+                    cwd=self.cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_OAUTH_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude.json",
+                    cwd=self.cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_CREDENTIALS_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude/.credentials.json",
+                    cwd=self.cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_SETTINGS_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude/settings.json",
+                    cwd=self.cwd,
+                )
+                await secure_path_for_user(
+                    sbox,
+                    f"{sandbox_home}/.claude",
+                    user=runtime_user or "root",
+                    recursive=True,
+                    cwd=self.cwd,
+                )
+                await secure_path_for_user(
+                    sbox,
+                    f"{sandbox_home}/.claude.json",
+                    user=runtime_user or "root",
+                    cwd=self.cwd,
+                )
+
             agent_env = {
-                "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
-                "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-                "ANTHROPIC_MODEL": default_model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": get_model(
-                    self._opus_model
-                ).canonical_name()
-                if self._opus_model
-                else default_model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": get_model(
-                    self._sonnet_model
-                ).canonical_name()
-                if self._sonnet_model
-                else default_model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": get_model(
-                    self._haiku_model
-                ).canonical_name()
-                if self._haiku_model
-                else default_model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": get_model(
-                    self._subagent_model
-                ).canonical_name()
-                if self._subagent_model
-                else default_model,
-                "ANTHROPIC_SMALL_FAST_MODEL": get_model(
-                    self._haiku_model
-                ).canonical_name()
-                if self._haiku_model
-                else default_model,
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
                 "API_TIMEOUT_MS": "100000000",
                 "IS_SANDBOX": "1",
                 "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
-            } | self.env
+            }
+            if self.bridge == "default":
+                agent_env |= {
+                    "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
+                    "ANTHROPIC_MODEL": default_model,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": get_model(
+                        self._opus_model
+                    ).canonical_name()
+                    if self._opus_model
+                    else default_model,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": get_model(
+                        self._sonnet_model
+                    ).canonical_name()
+                    if self._sonnet_model
+                    else default_model,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": get_model(
+                        self._haiku_model
+                    ).canonical_name()
+                    if self._haiku_model
+                    else default_model,
+                    "CLAUDE_CODE_SUBAGENT_MODEL": get_model(
+                        self._subagent_model
+                    ).canonical_name()
+                    if self._subagent_model
+                    else default_model,
+                    "ANTHROPIC_SMALL_FAST_MODEL": get_model(
+                        self._haiku_model
+                    ).canonical_name()
+                    if self._haiku_model
+                    else default_model,
+                }
+            else:
+                assert sandbox_ca_path is not None
+                agent_env |= {
+                    **proxy_env(bridge.port, proxy_host),
+                    "NODE_EXTRA_CA_CERTS": sandbox_ca_path,
+                    "NODE_USE_SYSTEM_CA": "1",
+                    "HOME": sandbox_home,
+                }
+            agent_env |= self.env
 
             # System prompt via env (the ACP adapter will forward to CC)
             resolved_prompt = self._resolve_system_prompt(state)
@@ -133,8 +225,11 @@ class ClaudeCode(ACPAgent):
 
             # Install skills
             if self._resolved_skills:
-                skills_dir = join_path(self.cwd, ".claude/skills")
-                await install_skills(self._resolved_skills, sbox, self.user, skills_dir)
+                skills_base = runtime_cwd or "."
+                skills_dir = join_path(skills_base, ".claude/skills")
+                await install_skills(
+                    self._resolved_skills, sbox, runtime_user, skills_dir
+                )
 
             # Start ACP adapter process
             logger.info("Starting claude-agent-acp adapter...")
@@ -142,9 +237,9 @@ class ClaudeCode(ACPAgent):
                 cmd=[acp_binary],
                 options=ExecRemoteStreamingOptions(
                     stdin_open=True,
-                    cwd=self.cwd,
+                    cwd=runtime_cwd,
                     env=agent_env,
-                    user=self.user,
+                    user=runtime_user,
                 ),
             )
 

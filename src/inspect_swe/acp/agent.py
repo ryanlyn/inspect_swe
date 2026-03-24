@@ -8,18 +8,20 @@ import logging
 from abc import abstractmethod
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 from acp import PROTOCOL_VERSION
 from acp.client.connection import ClientSideConnection
 from acp.schema import HttpMcpServer
-from inspect_ai.agent import Agent, AgentState, BridgedToolsSpec, SandboxAgentBridge
+from inspect_ai.agent import Agent, AgentState, BridgedToolsSpec
 from inspect_ai.log._samples import sample_active
 from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, get_model
 from inspect_ai.tool import MCPServerConfig, MCPServerConfigHTTP
 from inspect_ai.util import ExecRemoteProcess
 from typing_extensions import TypedDict, Unpack
+
+from inspect_swe._bridge.runtime import RuntimeBridge
 
 from .client import ACPError, acp_connection, format_acp_failure
 
@@ -71,6 +73,7 @@ class ACPAgentParams(TypedDict, total=False):
     env: dict[str, str] | None
     user: str | None
     sandbox: str | None
+    bridge: Literal["default", "mitmproxy"] | None
 
 
 class ACPAgent(Agent):
@@ -107,6 +110,7 @@ class ACPAgent(Agent):
         self.env: dict[str, str] = kwargs.get("env") or {}
         self.user = kwargs.get("user")
         self.sandbox = kwargs.get("sandbox")
+        self.bridge = kwargs.get("bridge") or "default"
 
         self.model_map: dict[str, str | Model] = self._build_model_map()
         model_map_override = kwargs.get("model_map")
@@ -129,7 +133,7 @@ class ACPAgent(Agent):
     async def _start_agent(
         self,
         state: AgentState,
-    ) -> AsyncIterator[tuple[ExecRemoteProcess, SandboxAgentBridge]]:
+    ) -> AsyncIterator[tuple[ExecRemoteProcess, RuntimeBridge]]:
         """Launch the ACP adapter process.  Yield ``(proc, bridge)``.
 
         *proc* is the ``ExecRemoteProcess`` with ``stdin_open=True``.
@@ -199,7 +203,7 @@ class ACPAgent(Agent):
                     # synchronously during new_session and will silently
                     # skip tools if the proxy isn't ready yet.
                     if all_configs:
-                        await _wait_for_mcp_endpoints(all_configs, bridge)
+                        await _wait_for_mcp_endpoints(all_configs)
 
                     async with acp_connection(proc) as (conn, feeder, error_info):
                         logger.info("ACP: initializing...")
@@ -240,7 +244,6 @@ class ACPAgent(Agent):
 
 async def _wait_for_mcp_endpoints(
     configs: list[MCPServerConfigHTTP],
-    bridge: SandboxAgentBridge,
     timeout: float = 30.0,
     interval: float = 0.5,
 ) -> None:

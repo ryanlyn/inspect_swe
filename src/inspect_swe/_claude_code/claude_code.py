@@ -18,6 +18,7 @@ from inspect_ai.agent import (
 from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
+from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import (
     ExecCompleted,
     ExecRemoteAwaitableOptions,
@@ -36,6 +37,19 @@ from inspect_ai.util._sandbox import (
 from pydantic import Field
 from pydantic_core import to_json
 
+from inspect_swe._bridge.ca import (
+    discover_sandbox_host,
+    proxy_env,
+    rewrite_http_url_host,
+    write_ca_cert_to_sandbox,
+)
+from inspect_swe._bridge.mitmproxy_bridge import mitmproxy_agent_bridge
+from inspect_swe._bridge.oauth import (
+    copy_optional_host_file_to_sandbox,
+    copy_optional_host_tree_to_sandbox,
+    ensure_sandbox_runtime_user,
+    secure_path_for_user,
+)
 from inspect_swe._claude_code._events.spans import annotate_agent_spans
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
 from inspect_swe._util.path import join_path
@@ -77,6 +91,7 @@ def claude_code(
     debug: bool | None = None,
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
+    bridge: Literal["default", "mitmproxy"] = "default",
 ) -> Agent:
     """Claude Code agent.
 
@@ -123,6 +138,7 @@ def claude_code(
             - "stable": Download and use the current stable version of claude code.
             - "latest": Download and use the very latest version of claude code.
             - "x.x.x": Download and use a specific version of claude code.
+        bridge: Bridge implementation to use. `"default"` preserves the existing localhost model proxy and `"mitmproxy"` enables transparent HTTPS interception.
     """
     # resolve centaur
     if centaur is True:
@@ -147,16 +163,25 @@ def claude_code(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
-        async with sandbox_agent_bridge(
-            state,
-            model=model,
-            model_aliases=model_aliases,
-            filter=filter,
-            sandbox=sandbox,
-            retry_refusals=retry_refusals,
-            port=port,
-            bridged_tools=bridged_tools,
-        ) as bridge:
+        bridge_cm = (
+            sandbox_agent_bridge(
+                state,
+                model=model,
+                model_aliases=model_aliases,
+                filter=filter,
+                sandbox=sandbox,
+                retry_refusals=retry_refusals,
+                port=port,
+                bridged_tools=bridged_tools,
+            )
+            if bridge == "default"
+            else mitmproxy_agent_bridge(
+                state,
+                sandbox=sandbox,
+                bridged_tools=bridged_tools,
+            )
+        )
+        async with bridge_cm as bridge_handle:
             # ensure claude is installed and get binary location
             claude_binary = await ensure_agent_binary_installed(
                 claude_code_binary_source(), version, user, sandbox_env(sandbox)
@@ -166,11 +191,9 @@ def claude_code(
             session_id = str(uuid.uuid4())
 
             # base options
-            cmd = [
-                "--dangerously-skip-permissions",
-                "--model",
-                model,
-            ]
+            cmd = ["--dangerously-skip-permissions"]
+            if bridge == "default":
+                cmd.extend(["--model", model])
 
             # add interactive options if not running as centaur
             if centaur is False:
@@ -189,7 +212,7 @@ def claude_code(
 
             # mcp servers (combine static configs with bridged tools)
             cmd_allowed_tools: list[str] = []
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
+            all_mcp_servers = list(mcp_servers or []) + bridge_handle.mcp_server_configs
             if all_mcp_servers:
                 mcp_server_args, mcp_allowed_tools = resolve_mcp_servers(
                     all_mcp_servers
@@ -209,6 +232,71 @@ def claude_code(
 
             # resolve sandbox
             sbox = sandbox_env(sandbox)
+            runtime_user = user
+            sandbox_home: str | None = None
+            runtime_cwd = cwd
+            if bridge == "mitmproxy":
+                runtime_user, sandbox_home = await ensure_sandbox_runtime_user(
+                    sbox,
+                    user,
+                    cwd=cwd,
+                )
+                if runtime_cwd in [None, "/root"]:
+                    runtime_cwd = sandbox_home
+                proxy_host = await discover_sandbox_host(
+                    sbox,
+                    user=runtime_user,
+                    cwd=runtime_cwd,
+                )
+                all_mcp_servers = [
+                    server.model_copy(
+                        update={"url": rewrite_http_url_host(server.url, proxy_host)}
+                    )
+                    if isinstance(server, MCPServerConfigHTTP)
+                    else server
+                    for server in all_mcp_servers
+                ]
+            sandbox_ca_path: str | None = None
+            if bridge == "mitmproxy":
+                sandbox_ca_path = await write_ca_cert_to_sandbox(sbox)
+                assert sandbox_home is not None
+                await copy_optional_host_tree_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_HOME_DIR",
+                    sandbox_root=f"{sandbox_home}/.claude",
+                    cwd=cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_OAUTH_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude.json",
+                    cwd=cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_CREDENTIALS_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude/.credentials.json",
+                    cwd=cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CLAUDE_SETTINGS_FILE",
+                    sandbox_path=f"{sandbox_home}/.claude/settings.json",
+                    cwd=cwd,
+                )
+                await secure_path_for_user(
+                    sbox,
+                    f"{sandbox_home}/.claude",
+                    user=runtime_user or "root",
+                    recursive=True,
+                    cwd=cwd,
+                )
+                await secure_path_for_user(
+                    sbox,
+                    f"{sandbox_home}/.claude.json",
+                    user=runtime_user or "root",
+                    cwd=cwd,
+                )
 
             # install skills
             if resolved_skills is not None:
@@ -220,26 +308,48 @@ def claude_code(
 
             # define agent env
             agent_env = {
-                "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
-                "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model or model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model or model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model or model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model or model,
-                "ANTHROPIC_SMALL_FAST_MODEL": haiku_model or model,
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
                 "IS_SANDBOX": "1",
-            } | (env or {})
+            }
+            if bridge == "default":
+                agent_env |= {
+                    "ANTHROPIC_BASE_URL": f"http://localhost:{bridge_handle.port}",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
+                    "ANTHROPIC_MODEL": model,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model or model,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model or model,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model or model,
+                    "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model or model,
+                    "ANTHROPIC_SMALL_FAST_MODEL": haiku_model or model,
+                }
+            else:
+                assert sandbox_ca_path is not None
+                agent_env |= {
+                    **proxy_env(bridge_handle.port, proxy_host),
+                    "NODE_EXTRA_CA_CERTS": sandbox_ca_path,
+                    "NODE_USE_SYSTEM_CA": "1",
+                    "HOME": sandbox_home,
+                }
+            agent_env |= env or {}
 
             # Claude Code 2.1.37 reports "has Authorization header: false"
             # despite ANTHROPIC_AUTH_TOKEN being set in the environment,
             # then enters an OAuth flow that silently fails (rc=0, no
             # output).  Providing an apiKeyHelper in settings.json
             # supplies a key through a path that does work.
-            api_key = agent_env.get("ANTHROPIC_AUTH_TOKEN", "dummy-key-for-bridge")
-            await _seed_claude_config(sbox, api_key, user, cwd)
+            if bridge == "default":
+                api_key = agent_env.get("ANTHROPIC_AUTH_TOKEN", "dummy-key-for-bridge")
+                await _seed_claude_config(sbox, api_key, user, cwd)
+            elif agent_env.get("ANTHROPIC_AUTH_TOKEN") and not str(
+                agent_env["ANTHROPIC_AUTH_TOKEN"]
+            ).startswith("sk-ant-oat"):
+                await _seed_claude_config(
+                    sbox,
+                    str(agent_env["ANTHROPIC_AUTH_TOKEN"]),
+                    user,
+                    cwd,
+                )
 
             # centaur mode uses human_cli with custom instructions and bash rc
             if centaur:
@@ -272,18 +382,32 @@ def claude_code(
                             + ["--", agent_prompt]
                         )
 
-                    # run agent
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
+                    remote_cmd = (
+                        ["bash", "-lc", 'exec 0</dev/null; exec "$@"', "bash"]
+                        + agent_cmd
                     )
+                    remote_user = runtime_user
+
+                    # run agent
+                    if bridge == "mitmproxy":
+                        result = await sbox.exec(
+                            cmd=remote_cmd,
+                            cwd=runtime_cwd,
+                            env=agent_env,
+                            user=remote_user,
+                            timeout=120,
+                        )
+                    else:
+                        result = await sbox.exec_remote(
+                            cmd=remote_cmd,
+                            options=ExecRemoteAwaitableOptions(
+                                cwd=runtime_cwd,
+                                env=agent_env,
+                                user=remote_user,
+                                concurrency=False,
+                            ),
+                            stream=False,
+                        )
                     # track debug output
                     debug_output.append(result.stderr)
 
@@ -300,6 +424,12 @@ def claude_code(
 
                     # raise for error
                     if not result.success:
+                        if (
+                            bridge == "mitmproxy"
+                            and bridge_handle.state.output is not None
+                        ):
+                            break
+
                         # if claude code exits with code 1 and no stderr, this
                         # means an uncaught exception reached the top of its
                         # main loop -- we treat this as a scaffold bug and
@@ -350,7 +480,7 @@ def claude_code(
                 debug_output.insert(0, "Claude Code Debug Output:")
                 trace("\n".join(debug_output))
 
-        return bridge.state
+        return bridge_handle.state
 
     # return agent with specified name and descritpion
     return agent_with(execute, name=name, description=description)

@@ -21,6 +21,13 @@ from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
+from inspect_swe._bridge.ca import (
+    discover_sandbox_host,
+    proxy_env,
+    rewrite_http_url_host,
+    write_ca_cert_to_sandbox,
+)
+from inspect_swe._bridge.mitmproxy_bridge import mitmproxy_agent_bridge
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
 from inspect_swe._util.messages import build_user_prompt
@@ -53,6 +60,7 @@ def gemini_cli(
     user: str | None = None,
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
+    bridge: Literal["default", "mitmproxy"] = "default",
 ) -> Agent:
     """Gemini CLI agent.
 
@@ -89,6 +97,7 @@ def gemini_cli(
             - "sandbox": Use sandbox version (raises RuntimeError if not available)
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
+        bridge: Bridge implementation to use. `"default"` preserves the existing localhost model proxy and `"mitmproxy"` enables transparent HTTPS interception.
     """
     # resolve centaur
     if centaur is True:
@@ -109,18 +118,30 @@ def gemini_cli(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
-        async with sandbox_agent_bridge(
-            state,
-            model=model,
-            model_aliases=model_aliases,
-            filter=filter,
-            sandbox=sandbox,
-            retry_refusals=retry_refusals,
-            port=port,
-            bridged_tools=bridged_tools,
-        ) as bridge:
+        bridge_cm = (
+            sandbox_agent_bridge(
+                state,
+                model=model,
+                model_aliases=model_aliases,
+                filter=filter,
+                sandbox=sandbox,
+                retry_refusals=retry_refusals,
+                port=port,
+                bridged_tools=bridged_tools,
+            )
+            if bridge == "default"
+            else mitmproxy_agent_bridge(
+                state,
+                sandbox=sandbox,
+                bridged_tools=bridged_tools,
+            )
+        )
+        async with bridge_cm as bridge_handle:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
+            sandbox_ca_path: str | None = None
+            if bridge == "mitmproxy":
+                sandbox_ca_path = await write_ca_cert_to_sandbox(sbox)
 
             # install skills
             if resolved_skills is not None:
@@ -136,7 +157,17 @@ def gemini_cli(
             )
 
             # mcp servers
-            all_mcp_servers = list(mcp_servers or []) + list(bridge.mcp_server_configs)
+            all_mcp_servers = list(mcp_servers or []) + list(
+                bridge_handle.mcp_server_configs
+            )
+            if bridge == "mitmproxy":
+                proxy_host = await discover_sandbox_host(sbox, user=user, cwd=cwd)
+                all_mcp_servers = [
+                    server.model_copy(update={"url": rewrite_http_url_host(server.url, proxy_host)})
+                    if isinstance(server, MCPServerConfigHTTP)
+                    else server
+                    for server in all_mcp_servers
+                ]
 
             # detect sandbox home directory
             home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=user)
@@ -189,11 +220,22 @@ def gemini_cli(
             # setup agent env (add node to PATH so the gemini shell script can find it)
             node_dir = str(Path(node_binary).parent)
             agent_env = {
-                "GOOGLE_GEMINI_BASE_URL": f"http://localhost:{bridge.port}",
-                "GEMINI_API_KEY": "api-key",
                 "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
                 "HOME": sandbox_home,  # Use detected sandbox home for config + npm cache
-            } | (env or {})
+            }
+            if bridge == "default":
+                agent_env |= {
+                    "GOOGLE_GEMINI_BASE_URL": f"http://localhost:{bridge_handle.port}",
+                    "GEMINI_API_KEY": "api-key",
+                }
+            else:
+                assert sandbox_ca_path is not None
+                agent_env |= {
+                    **proxy_env(bridge_handle.port, proxy_host),
+                    "NODE_EXTRA_CA_CERTS": sandbox_ca_path,
+                    "NODE_USE_SYSTEM_CA": "1",
+                }
+            agent_env |= env or {}
 
             if centaur:
                 await _run_gemini_cli_centaur(
@@ -250,7 +292,7 @@ def gemini_cli(
                         break
 
                     # score and check for success
-                    answer_scores = await score(bridge.state)
+                    answer_scores = await score(bridge_handle.state)
                     # break if we score 'correct'
                     if attempts.score_value(answer_scores[0].value) == 1.0:
                         break
@@ -261,9 +303,9 @@ def gemini_cli(
                             raise ValueError(
                                 "The incorrect_message function must be async."
                             )
-                        agent_prompt = await attempts.incorrect_message(
-                            bridge.state, answer_scores
-                        )
+                            agent_prompt = await attempts.incorrect_message(
+                                bridge_handle.state, answer_scores
+                            )
                     else:
                         agent_prompt = attempts.incorrect_message
 
@@ -271,7 +313,7 @@ def gemini_cli(
                 debug_output.insert(0, "Gemini CLI Debug Output:")
                 trace("\n".join(debug_output))
 
-        return bridge.state
+        return bridge_handle.state
 
     return agent_with(execute, name=name, description=description)
 

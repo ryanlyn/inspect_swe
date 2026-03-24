@@ -16,10 +16,24 @@ from inspect_ai.agent import (
 from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
+from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import SandboxEnvironment, store
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
+from inspect_swe._bridge.ca import (
+    discover_sandbox_host,
+    proxy_env,
+    rewrite_http_url_host,
+    write_ca_cert_to_sandbox,
+)
+from inspect_swe._bridge.mitmproxy_bridge import mitmproxy_agent_bridge
+from inspect_swe._bridge.oauth import (
+    copy_optional_host_file_to_sandbox,
+    copy_optional_host_tree_to_sandbox,
+    ensure_sandbox_runtime_user,
+    secure_path_for_user,
+)
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
 from inspect_swe._util.messages import build_user_prompt
@@ -60,6 +74,7 @@ def codex_cli(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "latest"] | str = "auto",
     config_overrides: dict[str, str] | None = None,
+    bridge: Literal["default", "mitmproxy"] = "default",
 ) -> Agent:
     """Codex CLI.
 
@@ -99,6 +114,7 @@ def codex_cli(
             - "x.x.x": Download and use a specific version of codex cli.
         config_overrides: Additional Codex CLI configuration overrides.
             Each key-value pair is passed as `-c key=value` to the CLI.
+        bridge: Bridge implementation to use. `"default"` preserves the existing localhost model proxy and `"mitmproxy"` enables transparent HTTPS interception.
     """
     # resolve centaur
     if centaur is True:
@@ -122,16 +138,25 @@ def codex_cli(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
-        async with sandbox_agent_bridge(
-            state,
-            model=model,
-            model_aliases=model_aliases,
-            filter=filter,
-            sandbox=sandbox,
-            retry_refusals=retry_refusals,
-            port=port,
-            bridged_tools=bridged_tools,
-        ) as bridge:
+        bridge_cm = (
+            sandbox_agent_bridge(
+                state,
+                model=model,
+                model_aliases=model_aliases,
+                filter=filter,
+                sandbox=sandbox,
+                retry_refusals=retry_refusals,
+                port=port,
+                bridged_tools=bridged_tools,
+            )
+            if bridge == "default"
+            else mitmproxy_agent_bridge(
+                state,
+                sandbox=sandbox,
+                bridged_tools=bridged_tools,
+            )
+        )
+        async with bridge_cm as bridge_handle:
             # ensure codex is installed and get binary location
             codex_binary = await ensure_agent_binary_installed(
                 codex_cli_binary_source(), version, user, sandbox_env(sandbox)
@@ -146,17 +171,62 @@ def codex_cli(
 
             # resolve sandbox
             sbox = sandbox_env(sandbox)
+            runtime_user = user
+            runtime_home: str | None = None
+            runtime_cwd = cwd
+            if bridge == "mitmproxy":
+                runtime_user, runtime_home = await ensure_sandbox_runtime_user(
+                    sbox,
+                    user,
+                    cwd=cwd,
+                )
+                if runtime_cwd in [None, "/root"]:
+                    runtime_cwd = runtime_home
+            sandbox_ca_path: str | None = None
+            if bridge == "mitmproxy":
+                sandbox_ca_path = await write_ca_cert_to_sandbox(sbox)
 
             # determine CODEX_HOME (default to whatever sandbox working dir is)
             if home_dir is None:
-                working_dir = await sandbox_exec(sbox, "pwd", user=user, cwd=cwd)
-                codex_home = join_path(working_dir, ".codex")
+                if bridge == "mitmproxy":
+                    assert runtime_home is not None
+                    codex_home = join_path(runtime_home, ".codex")
+                else:
+                    working_dir = await sandbox_exec(sbox, "pwd", user=user, cwd=cwd)
+                    codex_home = join_path(working_dir, ".codex")
             else:
                 # Resolve ~ and $VARS inside the sandbox
                 codex_home = await sandbox_exec(
-                    sbox, f'eval echo "{home_dir}"', user=user, cwd=cwd
+                    sbox, f'eval echo "{home_dir}"', user=runtime_user, cwd=cwd
                 )
-            await sandbox_exec(sbox, cmd=f"mkdir -p {codex_home}", user=user)
+            await sandbox_exec(sbox, cmd=f"mkdir -p {codex_home}", user=runtime_user)
+            copied_codex_auth = False
+            if bridge == "mitmproxy":
+                await copy_optional_host_tree_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CODEX_HOME_DIR",
+                    sandbox_root=codex_home,
+                    cwd=cwd,
+                )
+                copied_codex_auth = await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CODEX_AUTH_FILE",
+                    sandbox_path=join_path(codex_home, "auth.json"),
+                    cwd=cwd,
+                )
+                await copy_optional_host_file_to_sandbox(
+                    sbox,
+                    host_env_var="INSPECT_SWE_CODEX_CONFIG_FILE",
+                    sandbox_path=join_path(codex_home, "config.json"),
+                    cwd=cwd,
+                )
+                await secure_path_for_user(
+                    sbox,
+                    codex_home,
+                    user=runtime_user or "root",
+                    recursive=True,
+                    cwd=cwd,
+                )
 
             # location for agents_md
             def codex_agents_md() -> str:
@@ -171,11 +241,11 @@ def codex_cli(
             # location for config_toml (either codex_home or cwd/.codex )
             async def codex_config_toml() -> str:
                 CONFIG_TOML = "config.toml"
-                if home_dir is not None:
+                if home_dir is not None or bridge == "mitmproxy":
                     return join_path(codex_home, CONFIG_TOML)
                 else:
                     dir = ".codex" if cwd is None else join_path(cwd, ".codex")
-                    await sandbox_exec(sbox, cmd=f"mkdir -p {dir}", user=user)
+                    await sandbox_exec(sbox, cmd=f"mkdir -p {dir}", user=runtime_user)
                     return join_path(dir, CONFIG_TOML)
 
             # write system messages to AGENTS.md
@@ -185,7 +255,10 @@ def codex_cli(
             # install skills
             if resolved_skills is not None:
                 await install_skills(
-                    resolved_skills, sbox, user, join_path(codex_home, "skills")
+                    resolved_skills,
+                    sbox,
+                    runtime_user,
+                    join_path(codex_home, "skills"),
                 )
 
             prompt, has_assistant_response = build_user_prompt(state.messages)
@@ -220,7 +293,21 @@ def codex_cli(
             toml_config: dict[str, Any] = {}
 
             # register mcp servers (combine static configs with bridged tools)
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
+            all_mcp_servers = list(mcp_servers or []) + bridge_handle.mcp_server_configs
+            if bridge == "mitmproxy":
+                proxy_host = await discover_sandbox_host(
+                    sbox,
+                    user=runtime_user,
+                    cwd=runtime_cwd,
+                )
+                all_mcp_servers = [
+                    mcp_server.model_copy(
+                        update={"url": rewrite_http_url_host(mcp_server.url, proxy_host)}
+                    )
+                    if isinstance(mcp_server, MCPServerConfigHTTP)
+                    else mcp_server
+                    for mcp_server in all_mcp_servers
+                ]
             if all_mcp_servers:
                 for mcp_server in all_mcp_servers:
                     toml_config[f"mcp_servers.{mcp_server.name}"] = (
@@ -230,15 +317,18 @@ def codex_cli(
                     )
 
             # model provider if we are in centaur mode
-            if centaur:
+            if centaur and bridge == "default":
                 toml_config["preferred_auth_method"] = "apikey"
                 toml_config["model_provider"] = "openai-proxy"
                 toml_config["model_providers.openai-proxy"] = {
                     "name": "OpenAI Proxy",
-                    "base_url": f"http://localhost:{bridge.port}/v1",
+                    "base_url": f"http://localhost:{bridge_handle.port}/v1",
                     "env_key": "OPENAI_API_KEY",
                     "wire_api": "responses",
                 }
+            elif bridge == "mitmproxy" and copied_codex_auth:
+                toml_config["preferred_auth_method"] = "chatgpt"
+                toml_config["cli_auth_credentials_store"] = "file"
 
             # write toml config if we have it
             if len(toml_config) > 0:
@@ -247,10 +337,21 @@ def codex_cli(
             # setup agent env
             agent_env = {
                 "CODEX_HOME": codex_home,
-                "OPENAI_API_KEY": "api-key",
-                "OPENAI_BASE_URL": f"http://localhost:{bridge.port}/v1",
                 "RUST_LOG": "warning",
-            } | (env or {})
+            }
+            if bridge == "default":
+                agent_env |= {
+                    "OPENAI_API_KEY": "api-key",
+                    "OPENAI_BASE_URL": f"http://localhost:{bridge_handle.port}/v1",
+                }
+            else:
+                assert sandbox_ca_path is not None
+                agent_env |= {
+                    **proxy_env(bridge_handle.port, proxy_host),
+                    "CODEX_CA_CERTIFICATE": sandbox_ca_path,
+                    "SSL_CERT_FILE": sandbox_ca_path,
+                }
+            agent_env |= env or {}
 
             if centaur:
                 await _run_codex_cli_centaur(
@@ -273,15 +374,32 @@ def codex_cli(
                     if has_assistant_response or attempt_count > 0:
                         agent_cmd.extend(["resume", "--last"])
 
-                    # run agent
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=cwd, env=agent_env, user=user, concurrency=False
-                        ),
-                        stream=False,
+                    remote_cmd = (
+                        ["bash", "-lc", 'exec 0</dev/null; exec "$@"', "bash"]
+                        + agent_cmd
                     )
+                    remote_user = runtime_user
+
+                    # run agent
+                    if bridge == "mitmproxy":
+                        result = await sbox.exec(
+                            cmd=remote_cmd,
+                            cwd=runtime_cwd,
+                            env=agent_env,
+                            user=remote_user,
+                            timeout=120,
+                        )
+                    else:
+                        result = await sbox.exec_remote(
+                            cmd=remote_cmd,
+                            options=ExecRemoteAwaitableOptions(
+                                cwd=runtime_cwd,
+                                env=agent_env,
+                                user=remote_user,
+                                concurrency=False,
+                            ),
+                            stream=False,
+                        )
 
                     # record output for debug
                     debug_output.append(result.stdout)
@@ -289,6 +407,12 @@ def codex_cli(
 
                     # raise for error
                     if not result.success:
+                        if (
+                            bridge == "mitmproxy"
+                            and bridge_handle.state.output is not None
+                        ):
+                            break
+
                         raise RuntimeError(
                             f"Error executing codex cli agent {result.returncode}: {result.stdout}\n{result.stderr}"
                         )
@@ -323,7 +447,7 @@ def codex_cli(
                 trace("\n".join(debug_output))
 
         # return success
-        return bridge.state
+        return bridge_handle.state
 
     return agent_with(execute, name=name, description=description)
 
