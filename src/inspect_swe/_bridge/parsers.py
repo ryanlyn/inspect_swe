@@ -67,6 +67,9 @@ def parse_anthropic_traffic(
 ) -> tuple[list[ChatMessage], ModelOutput]:
     """Parse raw Anthropic Messages API traffic into Inspect types."""
     request_json = _coerce_json(request_body)
+    request_json["messages"] = _normalize_anthropic_request_messages(
+        cast(list[dict[str, Any]], request_json.get("messages", []))
+    )
     response_json = _coerce_anthropic_response(response_body)
 
     tools = tools_from_anthropic_tools(
@@ -144,6 +147,17 @@ def parse_openai_responses_traffic(
     response_body: str | dict[str, Any],
 ) -> tuple[list[ChatMessage], ModelOutput]:
     """Parse raw OpenAI Responses traffic into Inspect types."""
+    if isinstance(request_body, str) and isinstance(response_body, str):
+        request_lines = _parse_json_lines(request_body)
+        response_lines = _parse_json_lines(response_body)
+        if len(request_lines) > 1 and len(response_lines) > 1:
+            websocket_result = _parse_openai_responses_websocket_conversation(
+                request_lines,
+                response_lines,
+            )
+            if websocket_result is not None:
+                return websocket_result
+
     request_json = _coerce_openai_responses_request(request_body)
     response_json = _coerce_openai_responses_response(response_body)
     tools = [
@@ -233,6 +247,130 @@ def _coerce_openai_responses_request(
         if isinstance(event, dict) and event.get("type") == "response.create":
             return cast(dict[str, Any], event)
     raise ValueError("Unable to reconstruct OpenAI Responses request payload")
+
+
+def _parse_openai_responses_websocket_conversation(
+    request_events: list[dict[str, Any]],
+    response_events: list[dict[str, Any]],
+) -> tuple[list[ChatMessage], ModelOutput] | None:
+    request_creates = [
+        event for event in request_events if event.get("type") == "response.create"
+    ]
+    completed = [
+        cast(dict[str, Any], event["response"])
+        for event in response_events
+        if event.get("type") == "response.completed" and isinstance(event.get("response"), dict)
+    ]
+    if not request_creates or not completed:
+        return None
+
+    completed_by_id = {
+        str(response.get("id")): response
+        for response in completed
+        if response.get("id") is not None
+    }
+    last_response = completed[-1]
+
+    tools_source = next(
+        (
+            cast(list[dict[str, Any]], event.get("tools", []))
+            for event in reversed(request_creates)
+            if isinstance(event.get("tools"), list)
+        ),
+        [],
+    )
+    model_name = str(
+        next(
+            (
+                event.get("model")
+                for event in reversed(request_creates)
+                if event.get("model") is not None
+            ),
+            last_response.get("model", ""),
+        )
+    )
+    tools = [
+        tool_from_responses_tool(
+            tool,
+            internal_web_search_providers(),
+            default_code_execution_providers(),
+        )
+        for tool in tools_source
+    ]
+
+    input_messages: list[ChatMessage] = []
+    for index, request_json in enumerate(request_creates[:-1]):
+        request_input = request_json.get("input", [])
+        if request_input:
+            input_messages.extend(
+                messages_from_responses_input(
+                    request_input,
+                    tools,
+                    request_json.get("model"),
+                )
+            )
+        next_request = request_creates[index + 1]
+        previous_response_id = next_request.get("previous_response_id")
+        if previous_response_id is None:
+            continue
+        previous_response = completed_by_id.get(str(previous_response_id))
+        if previous_response is None:
+            continue
+        output_items = previous_response.get("output", [])
+        if output_items:
+            input_messages.extend(
+                messages_from_responses_input(
+                    output_items,
+                    tools,
+                    previous_response.get("model", request_json.get("model")),
+                )
+            )
+
+    last_request = request_creates[-1]
+    last_input = last_request.get("input", [])
+    if last_input:
+        input_messages.extend(
+            messages_from_responses_input(
+                last_input,
+                tools,
+                last_request.get("model"),
+            )
+        )
+
+    assistant = _find_assistant(
+        messages_from_responses_input(
+            last_response.get("output", []),
+            tools,
+            last_response.get("model", model_name),
+        )
+    )
+    assistant.model = str(last_response.get("model", model_name))
+    usage_json = cast(dict[str, Any], last_response.get("usage", {}))
+    stop_reason = "tool_calls" if assistant.tool_calls else "stop"
+    incomplete = cast(dict[str, Any] | None, last_response.get("incomplete_details"))
+    if incomplete and incomplete.get("reason") in {"max_output_tokens", "max_tokens"}:
+        stop_reason = "max_tokens"
+
+    return input_messages, _model_output(
+        assistant=assistant,
+        model=assistant.model or "",
+        stop_reason=cast(Any, stop_reason),
+        usage=ModelUsage(
+            input_tokens=int(usage_json.get("input_tokens", 0)),
+            output_tokens=int(usage_json.get("output_tokens", 0)),
+            total_tokens=int(usage_json.get("total_tokens", 0)),
+            input_tokens_cache_read=_optional_int(
+                usage_json.get("input_tokens_details", {}).get("cached_tokens")
+                if isinstance(usage_json.get("input_tokens_details"), dict)
+                else None
+            ),
+            reasoning_tokens=_optional_int(
+                usage_json.get("output_tokens_details", {}).get("reasoning_tokens")
+                if isinstance(usage_json.get("output_tokens_details"), dict)
+                else None
+            ),
+        ),
+    )
 
 
 def _coerce_openai_completions_response(
@@ -360,6 +498,38 @@ def _coerce_anthropic_response(payload: str | dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Unable to reconstruct Anthropic stream payload")
     message["content"] = [blocks[i] for i in sorted(blocks.keys())]
     return message
+
+
+def _normalize_anthropic_request_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            normalized.append(message)
+            continue
+        normalized_content: list[Any] = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("content"), list)
+            ):
+                tool_content: list[Any] = []
+                for item in cast(list[Any], block["content"]):
+                    if isinstance(item, dict) and item.get("type") == "tool_reference":
+                        tool_name = str(item.get("tool_name", ""))
+                        tool_content.append({"type": "text", "text": tool_name})
+                    else:
+                        tool_content.append(item)
+                normalized_block = dict(block)
+                normalized_block["content"] = tool_content
+                normalized_content.append(normalized_block)
+            else:
+                normalized_content.append(block)
+        normalized.append({**message, "content": normalized_content})
+    return normalized
 
 
 def _coerce_google_response(payload: str | dict[str, Any]) -> dict[str, Any]:
